@@ -1,6 +1,6 @@
 #!/bin/sh
 
-version_number="4.14.0"
+version_number="4.14.1"
 
 # UI
 
@@ -194,8 +194,9 @@ generate_link() {
 
 select_quality() {
     # removing urls which have soft subs to avoid playing on android, iSH and vlc (m3u8 streams don't get correct referrer)
-    printf '%s' "$player_function" | cut -f1 -d" " | grep -qE '(android|iSH|vlc)' && links=$(printf '%s' "$links" | sed '/cc>/d;/subtitle >/d;/m3u8_refr >/d')
-    printf '%s' "$player_function" | cut -f1 -d" " | grep -qE '(android|iSH)' && links=$(printf '%s' "$links" | sed '/Yt >/d')
+    # THE BELOW 2 LINES ARE COMMENTED OUT AS THE LATEST PROVIDER/SOURCES ARE BREAKING THE SCRIPT ON ANDROID DUE TO THESE; 
+    # printf '%s' "$player_function" | cut -f1 -d" " | grep -qE '(android|iSH|vlc)' && links=$(printf '%s' "$links" | sed '/cc>/d;/subtitle >/d;/m3u8_refr >/d')
+    # printf '%s' "$player_function" | cut -f1 -d" " | grep -qE '(android|iSH)' && links=$(printf '%s' "$links" | sed '/Yt >/d')
     case "$1" in
         best) result=$(printf "%s" "$links" | head -n1) ;;
         worst) result=$(printf "%s" "$links" | grep -E '^[0-9]{3,4}' | tail -n1) ;;
@@ -402,6 +403,7 @@ play_episode() {
                 [ "$exit_after_play" = 1 ] && [ -z "$range" ] && exit "$mpv_exitcode"
             fi
             ;;
+# SINCE REFERRER IS REQUIRED TO STREAM AND mpv-android DOESN'T ACCEPT REFERRER FLAGS THE SAME WAY ITS DESKTOP EQUIVALENT DOES, AN EDIT IN mpv.conf FILE IS MANUALLY REQUIRED
         android_mpv) nohup am start --user 0 -a android.intent.action.VIEW -d "$episode" -n is.xyz.mpv/.MPVActivity >/dev/null 2>&1 & ;;
         android_vlc) nohup am start --user 0 -a android.intent.action.VIEW -d "$episode" -n org.videolan.vlc/org.videolan.vlc.gui.video.VideoPlayerActivity -e "title" "${allanime_title}Episode ${ep_no}" >/dev/null 2>&1 & ;;
         *iina*)
