@@ -61,6 +61,11 @@ help_info() {
         Show logs
       -s, --syncplay
         Use Syncplay to watch with friends
+      -w, --party
+        Watch together in the browser: one link for your friend, no install, no account.
+        Host keeps this terminal open (it proxies the stream with the right headers).
+        Needs the watch-party extension installed (provides the server + adapter).
+        Set ANI_CLI_PARTY=syncplay for the old Syncplay room.
       -S, --select-nth
         Select nth entry
       -q, --quality
@@ -436,7 +441,142 @@ play_episode() {
     [ "$menu_program" != "fzf" ] && wait
 }
 
+# PARTY: both viewers' mpv fetch the stream themselves, Syncplay only syncs time, playlist and chat.
+# party.lua turns the url fragment back into --referrer/--audio-file/--sub-file on each side.
+
+party_enc() {
+    printf "%s" "$1" | sed 's/%/%25/g; s/&/%26/g; s/#/%23/g; s/=/%3D/g; s/+/%2B/g; s/ /%20/g'
+}
+
+# $1 = start position (optional)
+party_url() {
+    printf "%s#ap&i=%s&e=%s&t=%s%s%s%s%s%s%s\n" "$video_link" "$(party_enc "$anime_id")" "$ep_no" \
+        "$(party_enc "$anime_title Episode $ep_no")" "${refr:+&r=$(party_enc "$refr")}" \
+        "${origin:+&o=$(party_enc "$origin")}" "${audio_link:+&a=$(party_enc "$audio_link")}" \
+        "${sub_link:+&s=$(party_enc "$sub_link")}" "$([ "$hls" = 1 ] && printf '&h=1')" "${1:+&p=$1}"
+}
+
+party_lua() {
+    for _pl in "$(dirname "$0")/party/party.lua" "$party_dir/party.lua" "${XDG_DATA_HOME:-$HOME/.local/share}/ani-cli/party.lua" /usr/share/ani-cli/party.lua; do
+        [ -f "$_pl" ] && printf "%s" "$_pl" && return 0
+    done
+    mkdir -p "$party_dir" && $curl_exe -fsSL "$party_gist/party.lua" -o "$party_dir/party.lua" && printf "%s" "$party_dir/party.lua"
+}
+
+# called by the watch-party adapter: print the episode numbers of series $1, one per line
+party_list() {
+    anime_id="$1"
+    miruro_episodes "$anime_id"
+}
+
+# called by the watch-party adapter to resolve or refresh one episode's stream urls (they can expire mid-watch)
+party_ep() {
+    anime_id="$1" ep_no="$2" mode="${3:-$mode}" quality="${4:-$quality}" anime_title="$5"
+    [ -n "$anime_title" ] || anime_title=$(grep "	${anime_id}	" "$histfile" | head -n 1 | cut -f 3)
+    miruro_media "$ep_no" "$mode" >/dev/null 2>&1 || exit 1
+    select_quality "$quality" 2>/dev/null
+    [ -n "$video_link" ] && party_url
+}
+
+# called by party.lua on the host at ANI_CLI_PARTY_QUEUE_AT: mark episode $2 watched, print the url of the next one
+party_next() {
+    anime_id="$1" ep_no="$2" mode="${3:-$mode}" quality="${4:-$quality}" anime_title="$5"
+    [ -n "$anime_title" ] || anime_title=$(grep "	${anime_id}	" "$histfile" | head -n 1 | cut -f 3)
+    [ -n "$anime_title" ] && update_history
+    ep_list=$(miruro_episodes "$anime_id") || exit 1
+    ep_no=$(printf "%s" "$ep_list" | sed -n "/^${ep_no}$/{n;p;}")
+    # no next episode is a clean end, not an error: exit 0 with no output
+    [ -n "$ep_no" ] || exit 0
+    miruro_media "$ep_no" "$mode" >/dev/null 2>&1 || exit 1
+    select_quality "$quality" 2>/dev/null
+    [ -n "$video_link" ] || exit 1
+    party_url
+}
+
+party_browser() {
+    ep_no=$(printf "%s" "$ep_no" | head -n 1 | grep -Eo '^(-1|[0-9]+(\.[0-9]+)?)')
+    [ "$ep_no" = "-1" ] && ep_no=$(printf "%s" "$ep_list" | tail -n 1)
+    printf "%s" "$ep_list" | grep -q "^$ep_no$" || die "Invalid episode!"
+    [ -z "$video_link" ] && get_video_link
+    command -v python3 >/dev/null || die "party mode needs python3 on the host (friend only needs a browser)"
+    if [ -f "$0" ]; then _self="$0"; else _self=$(command -v "$0" 2>/dev/null || printf "%s" "$0"); fi
+    case "$_self" in /*) ;; *) _self="$PWD/$_self" ;; esac
+    # locate the watch-party server command and the ani-cli adapter
+    # v2 server only: the watch-party script is the frozen v1 and has no --source
+    _wp="${WATCH_PARTY_CMD:-$(command -v watch-party-v2 2>/dev/null)}"
+    _ad=""
+    for _c in "${ANI_CLI_PARTY_ADAPTER:-}" "$(dirname "$_self")/party/ani-cli" \
+        "$party_dir/ani-cli" "${XDG_DATA_HOME:-$HOME/.local/share}/ani-cli/ani-cli" \
+        /usr/share/watch-party/adapters/ani-cli; do
+        [ -n "$_c" ] && [ -f "$_c" ] && _ad="$_c" && break
+    done
+    [ -n "$_wp" ] || die "watch-party-v2 not found; build it (just build in the watch-party checkout) and set WATCH_PARTY_CMD"
+    [ -n "$_ad" ] || die "watch-party ani-cli adapter not found; set ANI_CLI_PARTY_ADAPTER"
+    _pos=""
+    [ -f "$party_state" ] && _pos=$(awk -F '\t' -v i="$anime_id" -v e="$ep_no" '$1 == i && $2 == e && $3 > 30 { print $3 - 5 }' "$party_state")
+    mkdir -p "$party_dir"
+    _purl=$(party_url "$_pos")
+    _media_file="$party_dir/media.json"
+    # fzf leaves its screen behind and ani-cli's tput sc/rc games hide output: start clean
+    tput clear 2>/dev/null || printf '\033[2J\033[H'
+    printf "\033[1;35mWatch party: %s, episode %s%s\033[0m\n" "$anime_title" "$ep_no" "${_pos:+ from ${_pos}s}"
+    python3 "$_ad" --emit "$_purl" >"$_media_file" || die "watch-party adapter failed to build the media descriptor"
+    # the server exits only when the party ends; -c resumes from the saved position.
+    # The adapter is a watch-party exec source (SPEC §3): it answers list/resolve/refresh.
+    exec "$_wp" serve --media "$_media_file" \
+        --state "$party_state" --link-file "$party_dir/link" \
+        --source exec -- python3 "$_ad" --ani-cli "$_self" --mode "$mode" --quality "$quality" \
+        --title "$anime_title"
+}
+
+party() {
+    if [ "${ANI_CLI_PARTY:-browser}" = syncplay ]; then
+        party_syncplay
+    else
+        party_browser
+    fi
+}
+
+party_syncplay() {
+    # one episode at a time; the rest come from the shared playlist
+    ep_no=$(printf "%s" "$ep_no" | head -n 1 | grep -Eo '^(-1|[0-9]+(\.[0-9]+)?)')
+    [ "$ep_no" = "-1" ] && ep_no=$(printf "%s" "$ep_list" | tail -n 1)
+    printf "%s" "$ep_list" | grep -q "^$ep_no$" || die "Invalid episode!"
+    [ -z "$video_link" ] && get_video_link
+    syncplay_player
+    _lua=$(party_lua) || die "party.lua not found and could not be downloaded from $party_gist"
+    _room="${ANI_CLI_PARTY_ROOM:-ani-${anime_id##*:}-$(printf "%s" "${USER:-$LOGNAME}@$(uname -n)" | cksum | cut -c 1-4)}"
+    _name="${ANI_CLI_PARTY_NAME:-${USER:-host}}"
+    _pos=""
+    [ -f "$party_state" ] && _pos=$(awk -F '\t' -v i="$anime_id" -v e="$ep_no" '$1 == i && $2 == e && $3 > 30 { print $3 - 5 }' "$party_state")
+    mkdir -p "$party_dir"
+    party_url "$_pos" >"$party_dir/playlist.txt"
+    # private syncplay.ini so the user's own syncplay config is untouched; mpv keeps its normal config dir
+    _mpv="${ANI_CLI_PARTY_MPV:-$(command -v mpv)}" || die "party mode needs mpv"
+    printf "[server_data]\nhost = %s\nport = %s\npassword = \n[client_settings]\nname = %s\nroom = %s\nplayerPath = %s\nforceGuiPrompt = False\nsharedPlaylistEnabled = True\nonlySwitchToTrustedDomains = False\nloopAtEndOfPlaylist = False\npauseOnLeave = True\nunpauseAction = Always\nfilenamePrivacyMode = SendHashed\n[general]\ncheckForUpdatesAutomatically = False\n" \
+        "${party_server%:*}" "${party_server##*:}" "$_name" "$_room" "$_mpv" >"$party_dir/syncplay.ini"
+    # history means "watched"; party.lua marks episodes at the queue point, so -c lands on a half-watched one
+    _ep="$ep_no"
+    ep_no=$(printf "%s" "$ep_list" | sed -n "/^${_ep}$/{g;1!p;};h")
+    [ -n "$ep_no" ] && update_history
+    ep_no="$_ep"
+    printf "\n\033[1;35mWatch party: %s, episode %s%s\033[0m\nroom: %s on %s\n\n" "$anime_title" "$ep_no" "${_pos:+ from ${_pos}s}" "$_room" "$party_server"
+    printf "Send your friend ONE of these:\n\n"
+    printf "  Windows (Win+R, paste, Enter):\n  powershell -ep bypass -c \"\$r='%s';irm %s/party.ps1|iex\"\n\n" "$_room" "$party_gist"
+    printf "  macOS / Linux (paste into Terminal):\n  curl -fsSL %s/party.sh | sh -s %s\n\n" "$party_gist" "$_room"
+    printf "In mpv: Enter opens chat, space pauses for both. Next episode is queued automatically at %s%%.\nCtrl-C here ends the party. Syncplay commands work below (help).\n\n" "${ANI_CLI_PARTY_QUEUE_AT:-80}"
+    _mpvconf="${XDG_CONFIG_HOME:-$HOME/.config}/mpv"
+    if [ -f "$0" ]; then _self="$0"; else _self=$(command -v "$0" 2>/dev/null || printf "%s" "$0"); fi
+    case "$_self" in /*) ;; *) _self="$PWD/$_self" ;; esac
+    # shellcheck disable=SC2086
+    XDG_CONFIG_HOME="$party_dir" $player_function --no-gui --no-store --load-playlist-from-file "$party_dir/playlist.txt" -- \
+        --config-dir="$_mpvconf" --scripts-append="$_lua" \
+        --script-opts="ani_party-host=yes,ani_party-cmd=$_self,ani_party-mode=$mode,ani_party-quality=$quality,ani_party-state=$party_state,ani_party-queue_at=${ANI_CLI_PARTY_QUEUE_AT:-80}"
+    exit 0
+}
+
 play() {
+    [ "$party" = 1 ] && party
     _start=$(printf "%s" "$ep_no" | grep -Eo '^(-1|[0-9]+(\.[0-9]+)?)')
     _end=$(printf "%s" "$ep_no" | grep -Eo '(-1|[0-9]+(\.[0-9]+)?)$')
     [ "$_start" = "-1" ] && ep_no=$(printf "%s" "$ep_list" | tail -n 1) && unset _start
@@ -463,6 +603,17 @@ play() {
     fi
     # moves up to stored position and deletes to end
     [ "$player_function" != "debug" ] && [ "$player_function" != "download" ] && tput rc && tput ed
+}
+
+syncplay_player() {
+    case "$(uname -s)" in
+        Darwin*) player_function="/Applications/Syncplay.app/Contents/MacOS/syncplay" ;;
+        MINGW* | *Msys)
+            export PATH="$PATH":"/c/Program Files (x86)/Syncplay/"
+            player_function="syncplay.exe"
+            ;;
+        *) player_function="syncplay" ;;
+    esac
 }
 
 # MAIN
@@ -514,6 +665,12 @@ histfile="$hist_dir/ani-hsts"
 source="${ANI_CLI_DEFAULT_SOURCE:-search}"
 branch="${ANI_CLI_BRANCH:-master}"
 
+party=0
+party_dir="${XDG_CACHE_HOME:-$HOME/.cache}/ani-cli/party"
+party_state="$hist_dir/party-pos"
+party_server="${ANI_CLI_PARTY_SERVER:-syncplay.pl:8999}"
+party_gist="${ANI_CLI_PARTY_GIST:-https://gist.githubusercontent.com/GIST_USER/GIST_ID/raw}"
+
 while [ $# -gt 0 ]; do
     case "$1" in
         -v | --vlc)
@@ -524,16 +681,23 @@ while [ $# -gt 0 ]; do
                 *) player_function="vlc" ;;
             esac
             ;;
-        -s | --syncplay)
-            case "$(uname -s)" in
-                Darwin*) player_function="/Applications/Syncplay.app/Contents/MacOS/syncplay" ;;
-                MINGW* | *Msys)
-                    export PATH="$PATH":"/c/Program Files (x86)/Syncplay/"
-                    player_function="syncplay.exe"
-                    ;;
-                *) player_function="syncplay" ;;
-            esac
+        --party-next)
+            shift
+            party_next "$@"
+            exit $?
             ;;
+        --party-ep)
+            shift
+            party_ep "$@"
+            exit $?
+            ;;
+        --party-list)
+            shift
+            party_list "$@"
+            exit $?
+            ;;
+        -w | --party) party=1 ;;
+        -s | --syncplay) syncplay_player ;;
         -q | --quality)
             [ $# -lt 2 ] && die "missing argument!"
             quality="$2"
