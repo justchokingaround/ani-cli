@@ -64,7 +64,7 @@ help_info() {
       -w, --party
         Watch together in the browser: one link for your friend, no install, no account.
         Host keeps this terminal open (it proxies the stream with the right headers).
-        Needs the watch-party extension installed (provides the server + adapter).
+        Needs watch-party installed (one binary: it ships the ani-cli source).
         Set ANI_CLI_PARTY=syncplay for the old Syncplay room.
       -S, --select-nth
         Select nth entry
@@ -463,13 +463,13 @@ party_lua() {
     mkdir -p "$party_dir" && $curl_exe -fsSL "$party_gist/party.lua" -o "$party_dir/party.lua" && printf "%s" "$party_dir/party.lua"
 }
 
-# called by the watch-party adapter: print the episode numbers of series $1, one per line
+# called by "watch-party source ani-cli": print the episode numbers of series $1, one per line
 party_list() {
     anime_id="$1"
     miruro_episodes "$anime_id"
 }
 
-# called by the watch-party adapter to resolve or refresh one episode's stream urls (they can expire mid-watch)
+# called by "watch-party source ani-cli" to resolve or refresh one episode's stream urls (they can expire mid-watch)
 party_ep() {
     anime_id="$1" ep_no="$2" mode="${3:-$mode}" quality="${4:-$quality}" anime_title="$5"
     [ -n "$anime_title" ] || anime_title=$(grep "	${anime_id}	" "$histfile" | head -n 1 | cut -f 3)
@@ -498,20 +498,12 @@ party_browser() {
     [ "$ep_no" = "-1" ] && ep_no=$(printf "%s" "$ep_list" | tail -n 1)
     printf "%s" "$ep_list" | grep -q "^$ep_no$" || die "Invalid episode!"
     [ -z "$video_link" ] && get_video_link
-    command -v python3 >/dev/null || die "party mode needs python3 on the host (friend only needs a browser)"
     if [ -f "$0" ]; then _self="$0"; else _self=$(command -v "$0" 2>/dev/null || printf "%s" "$0"); fi
     case "$_self" in /*) ;; *) _self="$PWD/$_self" ;; esac
-    # locate the watch-party server command and the ani-cli adapter
-    # v2 server only: the watch-party script is the frozen v1 and has no --source
-    _wp="${WATCH_PARTY_CMD:-$(command -v watch-party-v2 2>/dev/null)}"
-    _ad=""
-    for _c in "${ANI_CLI_PARTY_ADAPTER:-}" "$(dirname "$_self")/party/ani-cli" \
-        "$party_dir/ani-cli" "${XDG_DATA_HOME:-$HOME/.local/share}/ani-cli/ani-cli" \
-        /usr/share/watch-party/adapters/ani-cli; do
-        [ -n "$_c" ] && [ -f "$_c" ] && _ad="$_c" && break
-    done
-    [ -n "$_wp" ] || die "watch-party-v2 not found; build it (just build in the watch-party checkout) and set WATCH_PARTY_CMD"
-    [ -n "$_ad" ] || die "watch-party ani-cli adapter not found; set ANI_CLI_PARTY_ADAPTER"
+    # locate the watch-party server: it ships the ani-cli source itself
+    # ("watch-party source ani-cli"), so there is no adapter script any more.
+    _wp="${WATCH_PARTY_CMD:-$(command -v watch-party 2>/dev/null || command -v watch-party-v2 2>/dev/null)}"
+    [ -n "$_wp" ] || die "watch-party not found; build it (just build in the watch-party checkout) and set WATCH_PARTY_CMD"
     _pos=""
     [ -f "$party_state" ] && _pos=$(awk -F '\t' -v i="$anime_id" -v e="$ep_no" '$1 == i && $2 == e && $3 > 30 { print $3 - 5 }' "$party_state")
     mkdir -p "$party_dir"
@@ -520,12 +512,12 @@ party_browser() {
     # fzf leaves its screen behind and ani-cli's tput sc/rc games hide output: start clean
     tput clear 2>/dev/null || printf '\033[2J\033[H'
     printf "\033[1;35mWatch party: %s, episode %s%s\033[0m\n" "$anime_title" "$ep_no" "${_pos:+ from ${_pos}s}"
-    python3 "$_ad" --emit "$_purl" >"$_media_file" || die "watch-party adapter failed to build the media descriptor"
+    "$_wp" source ani-cli --emit "$_purl" >"$_media_file" || die "watch-party could not build the media descriptor"
     # the server exits only when the party ends; -c resumes from the saved position.
-    # The adapter is a watch-party exec source (SPEC §3): it answers list/resolve/refresh.
+    # "source ani-cli" is a watch-party exec source (SPEC §3): answers list/resolve/refresh.
     exec "$_wp" serve --media "$_media_file" \
         --state "$party_state" --link-file "$party_dir/link" \
-        --source exec -- python3 "$_ad" --ani-cli "$_self" --mode "$mode" --quality "$quality" \
+        --source exec -- "$_wp" source ani-cli --ani-cli "$_self" --mode "$mode" --quality "$quality" \
         --title "$anime_title"
 }
 
