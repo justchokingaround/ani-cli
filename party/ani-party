@@ -1,0 +1,790 @@
+#!/usr/bin/env python3
+"""ani-party: browser watch party for ani-cli, no accounts, no transcode.
+
+Browsers cannot send a Referer, so the friend's browser cannot fetch the CDN.
+This process runs on the host for the length of the party and:
+  * proxies the HLS playlists/segments byte-for-byte with the right Referer/Origin
+    (segments are fetched from the CDN once and shared by every viewer),
+  * converts the subtitle file to clean WebVTT (ASS typesetting filtered),
+  * keeps one shared play/pause/position state, chat and the episode queue,
+  * exposes all of it through an account-less tunnel (cloudflared quick tunnel,
+    or `ssh nokey@localhost.run` when cloudflared is missing).
+Viewers only open a link. Host machine needs python3 (stdlib only).
+
+Started by `ani-cli -w`; arguments are ani-cli's party_url (url#ap&i=..&e=..).
+"""
+import argparse
+import collections
+import hashlib
+import hmac
+import json
+import os
+import re
+import secrets
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"
+KEY = secrets.token_bytes(32)
+TOKEN = secrets.token_urlsafe(9)
+CACHE_BYTES = 400 * 1024 * 1024
+HLS_JS = None
+
+
+def log(*a):
+    print("\033[2m[party]\033[0m", *a, file=sys.stderr, flush=True)
+
+
+def parse_party_url(u):
+    base, _, frag = u.strip().partition("#ap&")
+    q = {}
+    for part in frag.split("&"):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            q[k] = urllib.parse.unquote(v)
+    if not base.startswith("http"):
+        raise ValueError("not a party url: %r" % u[:80])
+    return {
+        "video": base, "id": q.get("i", ""), "ep": q.get("e", ""), "title": q.get("t", ""),
+        "referer": q.get("r", ""), "origin": q.get("o", ""), "audio": q.get("a", ""),
+        "sub": q.get("s", ""), "hls": q.get("h") == "1", "pos": float(q.get("p") or 0),
+    }
+
+
+# ---------------------------------------------------------------- subtitles
+
+def _ass_time(t):
+    h, m, s = t.strip().split(":")
+    return int(h) * 3600 + int(m) * 60 + float(s)
+
+
+def _vtt_time(x):
+    x = max(0.0, x)
+    h, r = divmod(x, 3600)
+    m, s = divmod(r, 60)
+    return "%02d:%02d:%06.3f" % (h, m, s)
+
+
+KEEP_STYLE = re.compile(r"default|main|dialog|italic|top|alt|flashback|overlap|narrat|thought|internal", re.I)
+TYPESET = re.compile(r"\\(pos|move|org|clip|iclip|p[1-9]|k[fo]?\d|K\d|t\()")
+
+
+def ass_to_vtt(text):
+    fmt, rows = None, []
+    in_events = False
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("["):
+            in_events = s.lower() == "[events]"
+            continue
+        if not in_events:
+            continue
+        if s.lower().startswith("format:"):
+            fmt = [f.strip().lower() for f in s[7:].split(",")]
+        elif s.startswith("Dialogue:") and fmt:
+            vals = s[9:].lstrip().split(",", len(fmt) - 1)
+            if len(vals) == len(fmt):
+                rows.append(dict(zip(fmt, vals)))
+
+    def pick(strict):
+        out = []
+        for r in rows:
+            txt = r.get("text", "")
+            if r.get("effect", "").strip() or TYPESET.search(txt):
+                continue
+            if strict and not KEEP_STYLE.search(r.get("style", "")):
+                continue
+            out.append(r)
+        return out
+
+    keep = pick(True) or pick(False)
+    cues, seen = [], set()
+    for r in keep:
+        txt = r["text"]
+        top = "an8" in txt or "top" in r.get("style", "").lower()
+        txt = re.sub(r"\{[^}]*\\i1[^}]*\}", "<i>", txt)
+        txt = re.sub(r"\{[^}]*\\i0[^}]*\}", "</i>", txt)
+        txt = re.sub(r"\{[^}]*\}", "", txt)
+        txt = re.sub(r"</?font[^>]*>", "", txt, flags=re.I)
+        txt = txt.replace("\\N", "\n").replace("\\n", "\n").replace("\\h", " ").strip()
+        if "italic" in r.get("style", "").lower() and "<i>" not in txt:
+            txt = "<i>%s</i>" % txt
+        if txt.count("<i>") > txt.count("</i>"):
+            txt += "</i>"
+        if not re.sub(r"</?i>", "", txt).strip():
+            continue
+        try:
+            a, b = _ass_time(r["start"]), _ass_time(r["end"])
+        except (KeyError, ValueError):
+            continue
+        k = (a, b, txt)
+        if k in seen:
+            continue
+        seen.add(k)
+        cues.append((a, b, top, txt))
+    cues.sort()
+    out = ["WEBVTT", ""]
+    for a, b, top, txt in cues:
+        out.append("%s --> %s%s" % (_vtt_time(a), _vtt_time(b), " line:5%" if top else ""))
+        out.append(txt)
+        out.append("")
+    return "\n".join(out)
+
+
+def to_vtt(raw):
+    text = raw.decode("utf-8-sig", "replace").replace("\r\n", "\n")
+    head = text.lstrip()[:200]
+    if head.startswith("WEBVTT"):
+        return text
+    if "[Script Info]" in head or "[Events]" in text[:5000]:
+        return ass_to_vtt(text)
+    # SRT
+    text = re.sub(r"(\d\d:\d\d:\d\d),(\d\d\d)", r"\1.\2", text)
+    return "WEBVTT\n\n" + text
+
+
+def fetch_hls_js():
+    """Best-effort: serve hls.js from our own origin so the page has no third-party CDN."""
+    global HLS_JS
+    for u in ("https://cdn.jsdelivr.net/npm/hls.js@1.5.19/dist/hls.min.js",
+              "https://unpkg.com/hls.js@1.5.19/dist/hls.min.js"):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(u, headers={"User-Agent": UA}), timeout=20) as r:
+                HLS_JS = r.read()
+            if len(HLS_JS) > 100_000:
+                log("hls.js bundled (%d KB)" % (len(HLS_JS) // 1024))
+                return
+        except Exception as e:  # noqa: BLE001
+            log("hls.js fetch from %s failed: %s", u, e)
+    HLS_JS = None
+    log("WARNING: could not bundle hls.js; only browsers with native HLS (Safari/iOS) will play")
+
+
+# ---------------------------------------------------------------- party state
+
+class Party:
+    def __init__(self, media, args):
+        self.args = args
+        self.cv = threading.Condition()
+        self.seq = 0
+        self.events = collections.deque(maxlen=300)
+        self.gen = 1
+        self.headers = {1: media}          # gen -> media (referer/origin per episode)
+        self.media = media
+        self.play = {"paused": True, "pos": media["pos"], "at": time.time()}
+        self.dur = 0.0
+        self.viewers = {}
+        self.next_media = None
+        self.next_try = 0.0
+        self.busy = False
+        self.last_refresh = 0.0
+        self.cache = collections.OrderedDict()
+        self.cache_size = 0
+        self.inflight = {}
+        self.clock = threading.Lock()
+
+    # -- state helpers (hold self.cv)
+    def expected(self):
+        p = self.play
+        return p["pos"] if p["paused"] else p["pos"] + (time.time() - p["at"])
+
+    def push(self, ev):
+        self.seq += 1
+        ev["seq"] = self.seq
+        ev["ts"] = time.time()
+        self.events.append(ev)
+        self.cv.notify_all()
+
+    def system(self, text):
+        self.push({"t": "sys", "text": text})
+
+    def snapshot(self):
+        now = time.time()
+        return {
+            "gen": self.gen, "title": self.media["title"], "ep": self.media["ep"],
+            "hls": self.media["hls"], "audio": bool(self.media["audio"]),
+            "sub": bool(self.media["sub"]), "paused": self.play["paused"],
+            "pos": self.play["pos"], "at": self.play["at"], "busy": self.busy,
+            "viewers": sorted([{"name": v["name"], "buf": v["buf"]} for v in self.viewers.values()
+                               if now - v["seen"] < 15], key=lambda v: v["name"]),
+        }
+
+    # -- ani-cli callbacks
+    def run_cli(self, flag, ep):
+        a = self.args
+        cmd = [a.cmd, flag, self.media["id"], ep, a.mode, a.quality, self.media["title"].rsplit(" Episode ", 1)[0]]
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=90).stdout
+            line = [l for l in out.splitlines() if "#ap&" in l]
+            return parse_party_url(line[-1]) if line else None
+        except Exception as e:  # noqa: BLE001
+            log("ani-cli failed:", e)
+            return None
+
+    def set_media(self, m, pos, paused):
+        self.gen += 1
+        self.headers[self.gen] = m
+        self.media = m
+        self.dur = 0.0
+        self.play = {"paused": paused, "pos": pos, "at": time.time()}
+        self.next_media = None
+
+    def _resolve_next(self, ep):
+        return self.run_cli("--party-next", ep)
+
+    def _store_next(self, gen, m):
+        with self.cv:
+            self.busy = False
+            if gen == self.gen:
+                if m:
+                    self.next_media = m
+                    self.system("next up: episode %s" % m["ep"])
+                else:
+                    self.next_try = time.time() + 30  # transient scrape error; retry later
+            self.cv.notify_all()
+
+    def prefetch(self):
+        with self.cv:
+            if self.busy or self.next_media is not None or time.time() < self.next_try:
+                return
+            self.busy = True
+            gen, ep = self.gen, self.media["ep"]
+        self._store_next(gen, self._resolve_next(ep))
+
+    def advance(self, gen):
+        with self.cv:
+            if gen != self.gen:
+                return
+            if self.next_media is None and not self.busy:
+                self.busy = True
+                fetch_here, gen0, ep = True, self.gen, self.media["ep"]
+            else:
+                fetch_here = False
+        if fetch_here:
+            m = self._resolve_next(ep)
+            with self.cv:
+                self.busy = False
+                if gen0 == self.gen:
+                    self.next_media = m  # None => no next; dict => here's the next
+                self.cv.notify_all()
+        with self.cv:
+            end = time.time() + 30
+            while self.next_media is None and self.busy and time.time() < end:
+                self.cv.wait(0.5)
+            if gen != self.gen:
+                return
+            nm = self.next_media
+            if not nm:
+                self.system("no next episode (yet)")
+                self.play = {"paused": True, "pos": self.expected(), "at": time.time()}
+                self.push({"t": "state"})
+                return
+            self.set_media(nm, 0.0, False)
+            self.system("episode %s" % nm["ep"])
+        self.save()
+
+    def refresh(self, gen):
+        with self.cv:
+            if gen != self.gen or self.busy or time.time() - self.last_refresh < 45:
+                return
+            self.busy = True
+            self.last_refresh = time.time()
+        m = self.run_cli("--party-ep", self.media["ep"])
+        with self.cv:
+            self.busy = False
+            if m and gen == self.gen:
+                self.set_media(m, self.expected(), self.play["paused"])
+                self.system("stream links refreshed")
+            self.cv.notify_all()
+
+    def save(self):
+        p = self.args.state
+        if not p or not self.media["id"]:
+            return
+        with self.cv:
+            line = "%s\t%s\t%d\n" % (self.media["id"], self.media["ep"], self.expected())
+            mid = self.media["id"]
+        try:
+            rows = []
+            if os.path.exists(p):
+                with open(p) as f:
+                    rows = [r for r in f if r.split("\t", 1)[0] != mid]
+            with open(p + ".tmp", "w") as f:
+                f.writelines(rows + [line])
+            os.replace(p + ".tmp", p)
+        except OSError as e:
+            log("state save failed:", e)
+
+    # -- upstream fetch with shared segment cache
+    def sign(self, url, gen):
+        return hmac.new(KEY, ("%d|%s" % (gen, url)).encode(), hashlib.sha256).hexdigest()[:24]
+
+    def purl(self, url, gen):
+        return "/%s/p/%d/%s?u=%s" % (TOKEN, gen, self.sign(url, gen), urllib.parse.quote(url, safe=""))
+
+    def request(self, url, gen, rng=None):
+        m = self.headers.get(gen, self.media)
+        h = {"User-Agent": UA, "Accept": "*/*"}
+        if m["referer"]:
+            h["Referer"] = m["referer"]
+        if m["origin"]:
+            h["Origin"] = m["origin"]
+        if rng:
+            h["Range"] = rng
+        for i in range(4):
+            try:
+                return urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=25)
+            except urllib.error.HTTPError as e:
+                if e.code in (429, 500, 502, 503, 504) and i < 3:
+                    time.sleep(1.5 * (i + 1))
+                    continue
+                raise
+
+    def fetch_cached(self, url, gen):
+        key = url
+        with self.clock:
+            if key in self.cache:
+                self.cache.move_to_end(key)
+                return self.cache[key]
+            ev = self.inflight.get(key)
+            owner = ev is None
+            if owner:
+                ev = self.inflight[key] = threading.Event()
+        if not owner:
+            ev.wait(60)
+            with self.clock:
+                if key in self.cache:
+                    return self.cache[key]
+            raise urllib.error.URLError("upstream fetch failed")
+        try:
+            with self.request(url, gen) as r:
+                item = (r.status, r.headers.get("Content-Type", ""), r.read())
+            if not item[2].lstrip().startswith(b"#EXTM3U"):  # playlists stay fresh
+                with self.clock:
+                    self.cache[key] = item
+                    self.cache_size += len(item[2])
+                    while self.cache_size > CACHE_BYTES and self.cache:
+                        _, old = self.cache.popitem(last=False)
+                        self.cache_size -= len(old[2])
+            return item
+        finally:
+            with self.clock:
+                self.inflight.pop(key, None)
+            ev.set()
+
+    def rewrite(self, text, base, gen):
+        out = []
+        for line in text.replace("\r", "").split("\n"):
+            s = line.strip()
+            if not s:
+                continue
+            if s.startswith("#"):
+                s = re.sub(r'URI="([^"]+)"',
+                           lambda mo: 'URI="%s"' % self.purl(urllib.parse.urljoin(base, mo.group(1)), gen), s)
+            else:
+                s = self.purl(urllib.parse.urljoin(base, s), gen)
+            out.append(s)
+        return "\n".join(out) + "\n"
+
+
+# ---------------------------------------------------------------- http
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    party: Party = None  # type: ignore
+
+    def log_message(self, *a):
+        pass
+
+    def send(self, code, body=b"", ctype="text/plain", extra=None):
+        if isinstance(body, str):
+            body = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        if self.command != "HEAD":
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+    def do_HEAD(self):
+        self.do_GET()
+
+    def do_GET(self):
+        P = self.party
+        u = urllib.parse.urlsplit(self.path)
+        parts = u.path.strip("/").split("/")
+        q = dict(urllib.parse.parse_qsl(u.query))
+        if not parts or parts[0] != TOKEN:
+            return self.send(404, "not found")
+        route = parts[1] if len(parts) > 1 else ""
+        try:
+            if route == "":
+                return self.send(200, PAGE.replace("__TOKEN__", TOKEN), "text/html; charset=utf-8")
+            if route == "time":
+                return self.send(200, json.dumps({"now": time.time()}), "application/json")
+            if route == "hls.js":
+                if HLS_JS:
+                    return self.send(200, HLS_JS, "text/javascript")
+                return self.send(404, "no hls.js")
+            if route == "poll":
+                return self.poll(int(q.get("since", 0)))
+            if route == "m":
+                return self.media_entry(int(parts[2].split(".")[0]))
+            if route == "s":
+                return self.subs(int(parts[2].split(".")[0]))
+            if route == "p":
+                return self.proxy(int(parts[2]), parts[3], q.get("u", ""))
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        except urllib.error.HTTPError as e:
+            log("upstream HTTP %s for %s" % (e.code, self.path[:90]))
+            if e.code in (401, 403, 404, 410):
+                threading.Thread(target=P.refresh, args=(P.gen,), daemon=True).start()
+            return self.send(502, "upstream %s" % e.code)
+        except Exception as e:  # noqa: BLE001
+            log("error:", repr(e)[:200])
+            return self.send(502, "error")
+        return self.send(404, "not found")
+
+    def do_POST(self):
+        P = self.party
+        parts = self.path.strip("/").split("/")
+        if len(parts) != 2 or parts[0] != TOKEN or parts[1] != "send":
+            return self.send(404, "not found")
+        n = int(self.headers.get("Content-Length") or 0)
+        try:
+            msg = json.loads(self.rfile.read(min(n, 8192)) or b"{}")
+        except ValueError:
+            return self.send(400, "bad json")
+        t = msg.get("t")
+        name = str(msg.get("name") or "guest")[:24]
+        vid = str(msg.get("id") or name)[:32]
+        bg = None
+        with P.cv:
+            if t == "hb":
+                P.viewers[vid] = {"name": name, "buf": bool(msg.get("buf")), "seen": time.time()}
+                d = float(msg.get("dur") or 0)
+                if d > 60 and int(msg.get("gen", 0)) == P.gen:
+                    P.dur = d
+                    if P.expected() > 0.85 * d and P.next_media is None and not P.busy:
+                        bg = (P.prefetch, ())
+            elif t in ("play", "pause", "seek"):
+                pos = max(0.0, float(msg.get("pos") or 0))
+                paused = {"play": False, "pause": True}.get(t, P.play["paused"])
+                P.play = {"paused": paused, "pos": pos, "at": time.time()}
+                P.push({"t": "act", "name": name, "act": t, "pos": pos})
+            elif t == "chat":
+                text = str(msg.get("text") or "").strip()[:500]
+                if text:
+                    P.push({"t": "chat", "name": name, "text": text})
+            elif t in ("ended", "next"):
+                if t == "next":
+                    P.system("%s skipped to the next episode" % name)
+                bg = (P.advance, (int(msg.get("gen", 0)),))
+            elif t == "err":
+                bg = (P.refresh, (int(msg.get("gen", 0)),))
+            elif t == "join":
+                P.system("%s joined" % name)
+        if bg:
+            threading.Thread(target=bg[0], args=bg[1], daemon=True).start()
+        self.send(200, "{}", "application/json")
+
+    def poll(self, since):
+        P = self.party
+        deadline = time.time() + 20
+        with P.cv:
+            while P.seq <= since and time.time() < deadline:
+                P.cv.wait(deadline - time.time())
+            evs = [e for e in P.events if e["seq"] > since]
+            if since == 0:
+                evs = [e for e in evs if e["t"] in ("chat", "sys")][-30:]
+            body = json.dumps({"now": time.time(), "seq": P.seq, "events": evs, "state": P.snapshot()})
+        self.send(200, body, "application/json")
+
+    def media_entry(self, gen):
+        P = self.party
+        if gen not in P.headers:
+            return self.send(404, "gone")
+        m = P.headers[gen]
+        if m["hls"] and m["audio"]:
+            # ani-cli's video_link is already the video-only *media* playlist and the
+            # audio is a separate rendition, so rebuild the master hls.js needs.
+            body = ("#EXTM3U\n#EXT-X-VERSION:3\n"
+                    '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="audio",DEFAULT=YES,AUTOSELECT=YES,URI="%s"\n'
+                    '#EXT-X-STREAM-INF:BANDWIDTH=3000000,AUDIO="aud"\n%s\n') % (P.purl(m["audio"], gen), P.purl(m["video"], gen))
+            return self.send(200, body, "application/vnd.apple.mpegurl")
+        return self.send(302, "", extra={"Location": P.purl(m["video"], gen)})
+
+    def subs(self, gen):
+        P = self.party
+        m = P.headers.get(gen)
+        if not m or not m["sub"]:
+            return self.send(404, "no subs")
+        _, _, raw = P.fetch_cached(m["sub"], gen)
+        self.send(200, to_vtt(raw), "text/vtt; charset=utf-8")
+
+    def proxy(self, gen, sig, url):
+        P = self.party
+        if not url or not hmac.compare_digest(sig, P.sign(url, gen)):
+            return self.send(403, "bad signature")
+        rng = self.headers.get("Range")
+        if not P.headers[gen]["hls"]:
+            # direct mp4: stream it (never buffer a whole episode in memory)
+            return self.stream(gen, url, rng)
+        status, ctype, body = P.fetch_cached(url, gen)
+        if body.lstrip().startswith(b"#EXTM3U"):
+            txt = P.rewrite(body.decode("utf-8", "replace"), url, gen)
+            return self.send(200, txt, "application/vnd.apple.mpegurl")
+        if body[:1] == b"\x47":
+            ctype = "video/mp2t"            # disguised .jpg/.html/.css segments
+        elif body[4:8] in (b"ftyp", b"styp", b"moof", b"sidx"):
+            ctype = "video/mp4"
+        elif rng is None and "image" in ctype or "html" in ctype or "css" in ctype or "javascript" in ctype:
+            ctype = "application/octet-stream"
+        return self.send(200, body, ctype)
+
+    def stream(self, gen, url, rng):
+        with self.party.request(url, gen, rng) as r:
+            self.send_response(r.status)
+            for h in ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"):
+                if r.headers.get(h):
+                    self.send_header(h, r.headers[h])
+            self.end_headers()
+            while True:
+                chunk = r.read(256 * 1024)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+
+
+# ---------------------------------------------------------------- tunnel
+
+def start_tunnel(kind, port):
+    if kind == "auto":
+        kind = "cloudflared" if shutil.which("cloudflared") else "ssh"
+    if kind == "none":
+        return None, None
+    if kind == "cloudflared":
+        cmd = ["cloudflared", "tunnel", "--no-autoupdate", "--url", "http://127.0.0.1:%d" % port]
+        pat = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+    else:
+        cmd = ["ssh", "-T", "-o", "StrictHostKeyChecking=accept-new", "-o", "ServerAliveInterval=30",
+               "-o", "ExitOnForwardFailure=yes", "-R", "80:127.0.0.1:%d" % port, "nokey@localhost.run"]
+        pat = re.compile(r"https://[a-z0-9-]+\.(?:lhr\.life|localhost\.run)")
+    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, bufsize=1)
+    found = []
+
+    def reader():
+        for line in proc.stdout:
+            m = pat.search(line)
+            if m and not found:
+                found.append(m.group(0))
+    threading.Thread(target=reader, daemon=True).start()
+    t0 = time.time()
+    while not found and time.time() - t0 < 40 and proc.poll() is None:
+        time.sleep(0.2)
+    if not found:
+        proc.terminate()
+        raise SystemExit("tunnel (%s) did not come up; try --tunnel ssh or --tunnel none" % kind)
+    url = found[0]
+    # trycloudflare/lhr hostnames take a few seconds to appear in DNS. Polling a
+    # resolver too eagerly caches the NXDOMAIN, so wait first, then back off.
+    time.sleep(6)
+    delay = 3
+    for _ in range(25):
+        try:
+            urllib.request.urlopen("%s/%s/time" % (url, TOKEN), timeout=8).read()
+            break
+        except Exception:  # noqa: BLE001
+            time.sleep(delay)
+            delay = min(delay * 2, 15)
+    return proc, url
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("party_url")
+    ap.add_argument("--cmd", default="ani-cli", help="ani-cli to call for next episode / refresh")
+    ap.add_argument("--mode", default="sub")
+    ap.add_argument("--quality", default="best")
+    ap.add_argument("--state", default="", help="resume file (id<TAB>ep<TAB>seconds)")
+    ap.add_argument("--tunnel", default=os.environ.get("ANI_PARTY_TUNNEL", "auto"),
+                    choices=["auto", "cloudflared", "ssh", "none"])
+    ap.add_argument("--bind", default=os.environ.get("ANI_PARTY_BIND", "127.0.0.1"))
+    ap.add_argument("--port", type=int, default=int(os.environ.get("ANI_PARTY_PORT", 0)))
+    ap.add_argument("--link-file", default="", help="write the friend link here")
+    ap.add_argument("--no-open", action="store_true", help="don't open the host's browser")
+    a = ap.parse_args()
+    if os.environ.get("ANI_PARTY_NO_OPEN") == "1":
+        a.no_open = True
+
+    media = parse_party_url(a.party_url)
+    party = Party(media, a)
+    Handler.party = party
+    fetch_hls_js()
+    srv = ThreadingHTTPServer((a.bind, a.port), Handler)
+    srv.daemon_threads = True
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    local = "http://127.0.0.1:%d/%s/" % (port, TOKEN)
+    log("starting tunnel...")
+    proc, pub = start_tunnel(a.tunnel, port)
+    link = "%s/%s/" % (pub, TOKEN) if pub else local.replace("127.0.0.1", a.bind)
+
+    print("\n\033[1;35mWatch party: %s%s\033[0m" % (media["title"], " from %ds" % media["pos"] if media["pos"] else ""), flush=True)
+    print("\nSend your friend this link (any browser, phone works too):\n\n  \033[1m%s\033[0m\n" % link, flush=True)
+    for clip in (["wl-copy"], ["xclip", "-selection", "clipboard"], ["pbcopy"]):
+        if shutil.which(clip[0]):
+            subprocess.run(clip, input=link.encode(), check=False)
+            print("  (copied to clipboard)", flush=True)
+            break
+    print("\nYou: %s\nCtrl-C ends the party.\n" % local, flush=True)
+    if a.link_file:
+        try:
+            with open(a.link_file, "w") as f:
+                f.write(link + "\n")
+            print("  (also in %s)" % a.link_file, flush=True)
+        except OSError:
+            pass
+    if shutil.which("notify-send"):
+        subprocess.run(["notify-send", "ani-cli party", link], check=False)
+    if not a.no_open:
+        opener = shutil.which("xdg-open") or shutil.which("open")
+        if opener:
+            subprocess.Popen([opener, local], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    stop = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    try:
+        while not stop.wait(10):
+            party.save()
+            with party.cv:
+                n = sum(1 for e in party.events if e["t"] == "sys" and e["text"].endswith(" joined"))
+            if n != getattr(main, "_joined", 0):
+                main._joined = n
+                print("\r\033[2K[%d joined] link: \033[1m%s\033[0m" % (n, link), flush=True)
+            if proc and proc.poll() is not None:
+                log("tunnel died, restarting (the link changes!)")
+                proc, pub = start_tunnel(a.tunnel, port)
+                print("\nNEW link: \033[1m%s/%s/\033[0m\n" % (pub, TOKEN), flush=True)
+    except KeyboardInterrupt:
+        pass
+    party.save()
+    if proc:
+        proc.terminate()
+    print("\nparty over, position saved (ani-cli -w -c resumes)")
+
+
+PAGE = r"""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ani-party</title>
+<script src="/__TOKEN__/hls.js"></script>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#111;color:#ddd;font:15px system-ui,sans-serif;height:100vh;display:flex;flex-direction:column}
+#bar{display:flex;gap:.5em;align-items:center;padding:.4em .6em;background:#1b1b1b;flex-wrap:wrap}
+#bar b{color:#c9f}#bar button{background:#2a2a2a;color:#ddd;border:1px solid #444;border-radius:4px;padding:.2em .6em;cursor:pointer}
+#viewers{margin-left:auto;font-size:.85em;color:#999}
+#main{flex:1;display:flex;min-height:0}
+#stage{flex:1;position:relative;background:#000;display:flex;min-width:0}
+video{width:100%;height:100%;background:#000}
+#float{position:absolute;left:1em;bottom:4.5em;pointer-events:none;max-width:60%}
+#float div{background:#000a;padding:.2em .5em;margin-top:.2em;border-radius:4px;transition:opacity 1s}
+#chatin2{position:absolute;left:1em;bottom:4.5em;width:50%;display:none;background:#000c;color:#fff;border:1px solid #c9f;padding:.4em}
+#side{width:300px;display:flex;flex-direction:column;border-left:1px solid #333}
+#log{flex:1;overflow-y:auto;padding:.5em;font-size:.9em}#log .sys{color:#888;font-style:italic}#log b{color:#c9f}
+#chatin{border:0;border-top:1px solid #333;background:#1b1b1b;color:#ddd;padding:.6em}
+#join{position:fixed;inset:0;background:#000d;display:flex;align-items:center;justify-content:center;z-index:9}
+#join div{background:#1e1e1e;padding:1.5em;border-radius:8px;text-align:center}
+#join input,#join button{font-size:1.1em;padding:.4em;margin:.3em;border-radius:4px;border:1px solid #555;background:#2a2a2a;color:#eee}
+#stage:fullscreen #float div,#stage:-webkit-full-screen #float div{font-size:1.2em}
+@media (max-width:700px){#main{flex-direction:column}#side{width:auto;height:35vh;border-left:0}}
+</style></head><body>
+<div id="join"><div><div style="font-size:1.3em;margin-bottom:.5em">🍿 watch party</div>
+<input id="nick" placeholder="your name" maxlength="24"><br><button id="go">join</button></div></div>
+<div id="bar"><b id="title">…</b>
+<button id="next" title="next episode">next ⏭</button>
+<span>subs <button id="sm">−</button><span id="so">0.0</span>s<button id="sp">+</button></span>
+<button id="fs" title="fullscreen with chat (f)">⛶</button>
+<span id="viewers"></span></div>
+<div id="main"><div id="stage"><video id="v" controls playsinline></video><div id="float"></div>
+<input id="chatin2" placeholder="chat, Enter to send, Esc to close" maxlength="500"></div>
+<div id="side"><div id="log"></div><input id="chatin" placeholder="chat… (Enter)" maxlength="500"></div></div>
+<script>
+const B='/__TOKEN__/',v=document.getElementById('v'),$=id=>document.getElementById(id);
+let me=localStorage.ap_id||(localStorage.ap_id=Math.random().toString(36).slice(2,10));
+let name=localStorage.ap_name||'',seq=0,off=0,st=null,gen=0,hls=null,loading=false,joined=false;
+let subOff=parseFloat(localStorage.ap_sub||'0');
+const now=()=>Date.now()/1000+off;
+const exp=()=>!st?0:st.paused?st.pos:st.pos+(now()-st.at);
+const send=o=>fetch(B+'send',{method:'POST',body:JSON.stringify(Object.assign({name,id:me,gen},o))}).catch(()=>{});
+const esc=s=>s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+function line(html,cls){const d=document.createElement('div');d.innerHTML=html;if(cls)d.className=cls;const l=$('log');l.appendChild(d);l.scrollTop=1e9;
+ const f=document.createElement('div');f.innerHTML=html;$('float').appendChild(f);setTimeout(()=>f.style.opacity=0,7000);setTimeout(()=>f.remove(),8000);}
+function show(e){const t=x=>Math.floor(x/60)+':'+String(Math.floor(x%60)).padStart(2,'0');
+ if(e.t=='chat')line('<b>'+esc(e.name)+'</b> '+esc(e.text));
+ else if(e.t=='sys')line(esc(e.text),'sys');
+ else if(e.t=='act'&&e.name!=name)line(esc(e.name)+' '+({play:'pressed play',pause:'paused',seek:'jumped'})[e.act]+' at '+t(e.pos),'sys');}
+async function sync(){let best=1e9;for(let i=0;i<5;i++){const t0=Date.now()/1000;const r=await fetch(B+'time').then(r=>r.json());const t1=Date.now()/1000;
+ if(t1-t0<best){best=t1-t0;off=r.now-(t0+t1)/2}}}
+function applySubOff(){$('so').textContent=subOff.toFixed(1);for(const tr of v.textTracks){if(!tr.cues)continue;
+ for(const c of tr.cues){if(c._s===undefined){c._s=c.startTime;c._e=c.endTime}c.startTime=Math.max(0,c._s+subOff);c.endTime=Math.max(0,c._e+subOff)}}}
+function load(){gen=st.gen;loading=true;$('title').textContent=st.title;document.title=st.title;
+ if(hls){hls.destroy();hls=null}for(const t of [...v.querySelectorAll('track')])t.remove();
+ const src=B+'m/'+gen+'.m3u8';
+ if(st.sub){const t=document.createElement('track');t.kind='subtitles';t.label='subs';t.default=true;t.src=B+'s/'+gen+'.vtt';
+  t.onload=()=>{t.track.mode='showing';applySubOff()};v.appendChild(t)}
+ if(st.hls&&window.Hls&&Hls.isSupported()){hls=new Hls({maxBufferLength:40,maxMaxBufferLength:90,startPosition:exp()});
+  hls.loadSource(src);hls.attachMedia(v);
+  hls.on(Hls.Events.ERROR,(_,d)=>{if(!d.fatal)return;if(d.type==Hls.ErrorTypes.MEDIA_ERROR)hls.recoverMediaError();else{send({t:'err'});setTimeout(()=>hls&&hls.startLoad(),3000)}});}
+ else v.src=src;
+ v.addEventListener('loadedmetadata',()=>{v.currentTime=exp();loading=false;if(!st.paused)v.play().catch(()=>{});},{once:true});}
+function tick(){if(!st||!joined)return;if(st.gen!=gen)return load();if(loading||v.readyState<1)return;
+ if(st.paused&&!v.paused)v.pause();if(!st.paused&&v.paused&&!v.ended)v.play().catch(()=>{});
+ const d=exp()-v.currentTime;
+ if(Math.abs(d)>1.5)v.currentTime=exp();else if(!st.paused&&Math.abs(d)>.3)v.playbackRate=d>0?1.06:.94;else v.playbackRate=1;}
+v.addEventListener('pause',()=>{if(joined&&!loading&&st&&!st.paused&&!v.ended&&!v.seeking)send({t:'pause',pos:v.currentTime})});
+v.addEventListener('play',()=>{if(joined&&!loading&&st&&st.paused)send({t:'play',pos:v.currentTime})});
+v.addEventListener('seeked',()=>{if(joined&&!loading&&st&&Math.abs(v.currentTime-exp())>2)send({t:'seek',pos:v.currentTime})});
+v.addEventListener('ended',()=>send({t:'ended'}));
+async function poll(){for(;;){try{const j=await fetch(B+'poll?since='+seq).then(r=>r.json());seq=j.seq;st=j.state;
+ for(const e of j.events)show(e);
+ $('viewers').textContent=st.viewers.map(x=>x.name+(x.buf?' ⏳':'')).join(', ')+(st.busy?' · loading next…':'');tick();}
+ catch(e){await new Promise(r=>setTimeout(r,2000))}}}
+function chat(inp){const t=inp.value.trim();if(t)send({t:'chat',text:t});inp.value=''}
+$('chatin').onkeydown=e=>{if(e.key=='Enter')chat(e.target);e.stopPropagation()};
+$('chatin2').onkeydown=e=>{e.stopPropagation();if(e.key=='Enter'){chat(e.target);e.target.style.display='none';v.focus()}if(e.key=='Escape'){e.target.style.display='none'}};
+$('next').onclick=()=>{if(confirm('skip to the next episode for everyone?'))send({t:'next'})};
+$('sm').onclick=()=>{subOff-=.5;localStorage.ap_sub=subOff;applySubOff()};$('sp').onclick=()=>{subOff+=.5;localStorage.ap_sub=subOff;applySubOff()};
+const fs=()=>{const s=$('stage');if(document.fullscreenElement)document.exitFullscreen();else if(s.requestFullscreen)s.requestFullscreen();else if(v.webkitEnterFullscreen)v.webkitEnterFullscreen()};
+$('fs').onclick=fs;
+document.onkeydown=e=>{if(e.target.tagName=='INPUT')return;
+ if(e.key=='f'){fs();e.preventDefault()}
+ else if(e.key==' '){v.paused?v.play():v.pause();e.preventDefault()}
+ else if(e.key=='Enter'){if(document.fullscreenElement){const c=$('chatin2');c.style.display='block';c.focus()}else $('chatin').focus();e.preventDefault()}};
+$('nick').value=name;
+$('go').onclick=async()=>{name=($('nick').value.trim()||'guest-'+me.slice(0,4)).slice(0,24);localStorage.ap_name=name;
+ $('join').remove();joined=true;await sync().catch(()=>{});send({t:'join'});
+ setInterval(()=>send({t:'hb',dur:v.duration||0,buf:joined&&st&&!st.paused&&v.readyState<3}),5000);setInterval(tick,1000);setInterval(()=>sync().catch(()=>{}),120000);tick()};
+$('nick').onkeydown=e=>{if(e.key=='Enter')$('go').click()};
+poll();
+</script></body></html>
+"""
+
+if __name__ == "__main__":
+    main()
