@@ -217,6 +217,7 @@ miruro_media() {
     mal_id="${anime_id##*:}"
     _me_show="${anime_id#*:}"
     _me_page=$(miruro_curl "$miruro_base/watch/${_me_show%%:*}/x?ep=$1") || return 1
+    poster=$(printf "%s\n" "$_me_page" | grep -o 'coverImage:{[^}]*}' | head -n 1 | sed -nE 's/.*[{,]large:"([^"]+)".*/\1/p')
     _me_tracks=$(printf "%s\n" "$_me_page" | grep 'tracks:\[' | sed 's/.*tracks:\[//; s/\],config:.*//; s/{track:"/\n{track:"/g')
     _me_wanted="ssub sub"
     [ "$2" = "dub" ] && _me_wanted="dub"
@@ -450,10 +451,11 @@ party_enc() {
 
 # $1 = start position (optional)
 party_url() {
-    printf "%s#ap&i=%s&e=%s&t=%s%s%s%s%s%s%s\n" "$video_link" "$(party_enc "$anime_id")" "$ep_no" \
+    printf "%s#ap&i=%s&e=%s&t=%s%s%s%s%s%s%s%s\n" "$video_link" "$(party_enc "$anime_id")" "$ep_no" \
         "$(party_enc "$anime_title Episode $ep_no")" "${refr:+&r=$(party_enc "$refr")}" \
         "${origin:+&o=$(party_enc "$origin")}" "${audio_link:+&a=$(party_enc "$audio_link")}" \
-        "${sub_link:+&s=$(party_enc "$sub_link")}" "$([ "$hls" = 1 ] && printf '&h=1')" "${1:+&p=$1}"
+        "${sub_link:+&s=$(party_enc "$sub_link")}" "${poster:+&c=$(party_enc "$poster")}" \
+        "$([ "$hls" = 1 ] && printf '&h=1')" "${1:+&p=$1}"
 }
 
 party_lua() {
@@ -463,10 +465,28 @@ party_lua() {
     mkdir -p "$party_dir" && $curl_exe -fsSL "$party_gist/party.lua" -o "$party_dir/party.lua" && printf "%s" "$party_dir/party.lua"
 }
 
-# called by "watch-party source ani-cli": print the episode numbers of series $1, one per line
+# called by "watch-party source ani-cli": one line per episode of series $1,
+# "number<TAB>title<TAB>thumb<TAB>duration", from miruro's own episode data.
+# Title, thumb and duration may be empty; the title is the raw JS string body
+# (escapes kept), the source decodes it and fills gaps from AniList/Kitsu.
 party_list() {
-    anime_id="$1"
-    miruro_episodes "$anime_id"
+    _ep_show="${1#*:}"
+    _ep_page="$(miruro_curl "$miruro_base/watch/${_ep_show%%:*}/x?ep=1")" || return 1
+    printf "%s" "$_ep_page" | sed 's/\([,{;]\)number:/\
+number:/g; s/[.]number=/\
+number:/g' | awk '
+        function field(re, skip, trim) {
+            if (!match($0, re)) return ""
+            return substr($0, RSTART + skip, RLENGTH - skip - trim)
+        }
+        /^number:[0-9]/ {
+            sub(/filler[:=][^,;}]*.*/, "")
+            n = field("^number:[0-9]+([.][0-9]+)?", 7, 0)
+            t = field("[.,]title[:=]\"([^\"\\\\]|\\\\.)*\"", 8, 1)
+            i = field("[.,]image[:=]\"[^\"]*\"", 8, 1)
+            d = field("[.,;]duration[:=][0-9]+([.][0-9]+)?", 10, 0)
+            if (!(n in seen)) { seen[n] = 1; printf "%s\t%s\t%s\t%s\n", n, t, i, d }
+        }' | LC_ALL=C sort -n
 }
 
 # called by "watch-party source ani-cli" to resolve or refresh one episode's stream urls (they can expire mid-watch)
