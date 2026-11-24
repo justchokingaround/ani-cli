@@ -498,6 +498,17 @@ party_ep() {
     [ -n "$video_link" ] && party_url
 }
 
+# called by "watch-party source ani-cli" once an episode counts as watched (80%
+# in): history is the last episode watched, so "ani-cli -c" offers the one after
+# it, whichever episode the party's browser had you pick.
+party_history() {
+    anime_id="$1" ep_no="$2" anime_title="$3"
+    [ -n "$anime_id" ] && [ -n "$ep_no" ] || exit 1
+    [ -n "$anime_title" ] || anime_title=$(grep "	${anime_id}	" "$histfile" | head -n 1 | cut -f 3)
+    [ -n "$anime_title" ] || exit 1
+    update_history
+}
+
 # called by party.lua on the host at ANI_CLI_PARTY_QUEUE_AT: mark episode $2 watched, print the url of the next one
 party_next() {
     anime_id="$1" ep_no="$2" mode="${3:-$mode}" quality="${4:-$quality}" anime_title="$5"
@@ -522,8 +533,8 @@ party_browser() {
     case "$_self" in /*) ;; *) _self="$PWD/$_self" ;; esac
     # locate the watch-party server: it ships the ani-cli source itself
     # ("watch-party source ani-cli"), so there is no adapter script any more.
-    _wp="${WATCH_PARTY_CMD:-$(command -v watch-party 2>/dev/null || command -v watch-party-v2 2>/dev/null)}"
-    [ -n "$_wp" ] || die "watch-party not found; build it (just build in the watch-party checkout) and set WATCH_PARTY_CMD"
+    _wp="${WATCH_PARTY_CMD:-$(command -v watch-party 2>/dev/null)}"
+    [ -n "$_wp" ] || die "watch-party not found; run 'just install' in the watch-party checkout or set WATCH_PARTY_CMD"
     _pos=""
     [ -f "$party_state" ] && _pos=$(awk -F '\t' -v i="$anime_id" -v e="$ep_no" '$1 == i && $2 == e && $3 > 30 { print $3 - 5 }' "$party_state")
     mkdir -p "$party_dir"
@@ -536,7 +547,7 @@ party_browser() {
     # the server exits only when the party ends; -c resumes from the saved position.
     # "source ani-cli" is a watch-party exec source (SPEC §3): answers list/resolve/refresh.
     exec "$_wp" serve --media "$_media_file" \
-        --state "$party_state" --link-file "$party_dir/link" \
+        --state "$party_state" --resume --link-file "$party_dir/link" \
         --source exec -- "$_wp" source ani-cli --ani-cli "$_self" --mode "$mode" --quality "$quality" \
         --title "$anime_title"
 }
@@ -706,6 +717,11 @@ while [ $# -gt 0 ]; do
         --party-list)
             shift
             party_list "$@"
+            exit $?
+            ;;
+        --party-history)
+            shift
+            party_history "$@"
             exit $?
             ;;
         -w | --party) party=1 ;;
